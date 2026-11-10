@@ -571,6 +571,9 @@ version = "0.1.0"
 dependencies = [
  "prometheus-expfmt",
  "prometheus-relabel",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

@@ -18,3 +18,5 @@
 
 pub use prometheus_expfmt as expfmt;
 pub use prometheus_relabel as relabel;
+
+pub mod discovery;
