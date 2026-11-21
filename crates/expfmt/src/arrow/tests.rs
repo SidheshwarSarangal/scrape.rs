@@ -27,6 +27,8 @@ fn assert_timestamp_column(
 ) {
     let column = batch.column_by_name(column_name);
     let Some(expected) = expected else {
+        // An untimestamped batch omits the column entirely rather than materializing an all-null
+        // column, which is also what downstream OTAP consumers observe.
         assert!(column.is_none(), "{column_name} should be omitted");
         return;
     };
@@ -73,10 +75,13 @@ fn sample_timestamp_policy_applies_to_single_and_streamed_data_points() {
 
         for honor_timestamps in [true, false] {
             for timestamp_ms in [Some(20_000), None] {
-                let mut opts = DecodeOptions::new()
+                let opts = DecodeOptions::new()
                     .with_honor_timestamps(honor_timestamps)
                     .with_max_data_points_per_batch(1);
-                opts.timestamp_ms = timestamp_ms;
+                let opts = match timestamp_ms {
+                    Some(ms) => opts.with_timestamp_ms(ms),
+                    None => opts,
+                };
 
                 for streaming in [false, true] {
                     let result = if streaming {
@@ -88,6 +93,13 @@ fn sample_timestamp_policy_applies_to_single_and_streamed_data_points() {
                             .decode(payload.as_bytes(), &format, &opts)
                             .map(|records| vec![records])
                     };
+                    if !honor_timestamps && timestamp_ms.is_none() {
+                        assert!(
+                            matches!(result, Err(DecodeError::MissingFallbackTimestamp)),
+                            "format={format:?}, timestamp={wire_timestamp}, streaming={streaming}"
+                        );
+                        continue;
+                    }
                     if honor_timestamps && expected_wire_ns.is_none() {
                         assert!(matches!(result, Err(DecodeError::TimestampOverflow { .. })));
                         continue;
@@ -195,15 +207,16 @@ fn ignoring_sample_timestamps_preserves_exemplar_and_start_timestamps() {
 #[test]
 fn ignoring_sample_timestamps_still_validates_syntax_defaults_and_exemplars() {
     let mut decoder = ArrowDecoder::new();
-    let opts = DecodeOptions::new().with_honor_timestamps(false);
+    let opts = DecodeOptions::new()
+        .with_timestamp_ms(20_000)
+        .with_honor_timestamps(false);
     // Like Go's Prometheus text lexer, signed wire timestamps are invalid syntax even when
     // sample timestamps are ignored. OpenMetrics signed timestamps are covered above.
     for payload in ["m 1 invalid\n", "m 1 -10000\n", "m 1 -9223372036855\n"] {
-        assert!(
-            decoder
-                .decode(payload.as_bytes(), &Format::TEXT, &opts)
-                .is_err()
-        );
+        assert!(matches!(
+            decoder.decode(payload.as_bytes(), &Format::TEXT, &opts),
+            Err(DecodeError::Syntax { .. } | DecodeError::InvalidTimestamp(_))
+        ));
     }
     let opts = opts.with_timestamp_ms(9_223_372_036_855);
     assert!(matches!(
@@ -211,7 +224,9 @@ fn ignoring_sample_timestamps_still_validates_syntax_defaults_and_exemplars() {
         Err(DecodeError::TimestampOverflow { .. })
     ));
 
-    let opts = DecodeOptions::new().with_honor_timestamps(false);
+    let opts = DecodeOptions::new()
+        .with_timestamp_ms(20_000)
+        .with_honor_timestamps(false);
     for payload in [
         "# TYPE c counter\nc_total 2 10.0 # {id=\"a\"} 1 1000000000000.0\n# EOF\n",
         "# TYPE h histogram\nh_bucket{le=\"+Inf\"} 2 10.0 # {id=\"a\"} 1 1000000000000.0\n# EOF\n",
@@ -221,6 +236,30 @@ fn ignoring_sample_timestamps_still_validates_syntax_defaults_and_exemplars() {
             Err(DecodeError::TimestampOverflow { .. })
         ));
     }
+}
+
+#[test]
+fn ignoring_sample_timestamps_requires_fallback_timestamp() {
+    let mut decoder = ArrowDecoder::new();
+    let opts = DecodeOptions::new().with_honor_timestamps(false);
+    let input = b"m 1 10000\n";
+    assert!(matches!(
+        decoder.decode(input, &Format::TEXT, &opts),
+        Err(DecodeError::MissingFallbackTimestamp)
+    ));
+    assert!(matches!(
+        decoder.start_decode(&Format::TEXT, &opts),
+        Err(DecodeError::MissingFallbackTimestamp)
+    ));
+    assert!(matches!(
+        decoder.start_decode_stream(&Format::TEXT, &opts),
+        Err(DecodeError::MissingFallbackTimestamp)
+    ));
+    let mut stream = decoder.decode_stream(input, &Format::TEXT, &opts);
+    assert!(matches!(
+        stream.next(),
+        Some(Err(DecodeError::MissingFallbackTimestamp))
+    ));
 }
 
 #[test]

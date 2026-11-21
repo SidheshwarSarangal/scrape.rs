@@ -42,10 +42,11 @@ use crate::parse::{
 
 use self::columns::{
     AttrEncoding, HistogramDpTable, MetricTable, NumberDpTable, ScratchBuffers, SummaryDpTable,
-    f64_to_u64_count, ms_to_ns, parse_hex_array,
+    f64_to_u64_count, parse_hex_array,
 };
 use self::family::{CurrentFamily, FamilyAssembly, SeriesRole};
 use self::intern::StringInterner;
+use self::options::ms_to_ns;
 pub use self::options::{
     CounterSuffixPolicy, DECODE_BUDGET_DURATION_CHECK_INTERVAL, DEFAULT_DECODE_BUDGET_MAX_BYTES,
     DEFAULT_DECODE_BUDGET_MAX_DURATION, DEFAULT_DECODE_BUDGET_MAX_ENTRIES,
@@ -704,6 +705,9 @@ impl ArrowDecoder {
         format: &Format,
         opts: &DecodeOptions,
     ) -> Result<(ActiveParser<'input>, Option<i64>), DecodeError> {
+        if !opts.honor_timestamps && opts.timestamp_ms.is_none() {
+            return Err(DecodeError::MissingFallbackTimestamp);
+        }
         let default_ts_ns = match opts.timestamp_ms {
             Some(ms) => Some(ms_to_ns(ms)?),
             None => None,
@@ -1106,10 +1110,7 @@ impl ArrowDecoder {
             .current_family
             .emit_into_batch(&mut self.metrics, opts)?;
         let start_ts_ns = start_ts_ms.and_then(|ms| ms.checked_mul(1_000_000));
-        let resolved_ts_ns = match (opts.honor_timestamps, sample_ts_ms) {
-            (true, Some(ms)) => Some(ms_to_ns(ms)?),
-            _ => default_ts_ns,
-        };
+        let resolved_ts_ns = opts.resolve_sample_ts_ns(sample_ts_ms, default_ts_ns)?;
         self.num_dp
             .base
             .push(parent_id, start_ts_ns, resolved_ts_ns);
@@ -1137,10 +1138,11 @@ impl ArrowDecoder {
         };
 
         let group_idx = self.assembly.find_or_create_group(&self.temp_attrs);
-        let sample_ts_ns = match (opts.honor_timestamps, sample_ts_ms) {
-            (true, Some(ms)) => Some(ms_to_ns(ms)?),
-            _ => None,
-        };
+        // The scrape timestamp is applied per data point when the family is flushed,
+        // so no fallback is resolved here.
+        // Resolving one here would let this path and `append_scalar_series` disagree on which
+        // timestamp wins.
+        let sample_ts_ns = opts.resolve_sample_ts_ns(sample_ts_ms, None)?;
         let om_start_ts_ns = if !self.assembly.groups[group_idx].start_ts_checked {
             self.assembly.groups[group_idx].start_ts_checked = true;
             if parser.is_openmetrics() {
